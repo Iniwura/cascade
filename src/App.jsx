@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react'
 import Panel from './components/Panel.jsx'
 import CascadeTree from './components/Cascade.jsx'
+import Messages from './components/Messages.jsx'
 import VerdictBars from './components/VerdictBars.jsx'
 import Dashboard from './components/Dashboard.jsx'
 import JobBoard from './components/JobBoard.jsx'
@@ -57,6 +58,7 @@ export default function App() {
   const [tx, setTx] = useState(null)
   const [copiedAddr, setCopiedAddr] = useState(false)
   const [boardReload, setBoardReload] = useState(0)
+  const [sendingMsgId, setSendingMsgId] = useState('')
   const [showOnboarding, setShowOnboarding] = useState(false)
   const { notes: jobNotes, unread, markAllRead } = useNotifications(account)
   const noteId = useRef(0)
@@ -214,9 +216,55 @@ export default function App() {
     send('work submitted', 'submit_deliverable', [id, urls.trim()], 0n,
       async () => { const t = await readTree(); return t && t[id]?.status === 'submitted' })
 
-  const askJury = (id) =>
-    send('jury asked', 'resolve_task', [id], 0n,
-      async () => { const t = await readTree(); return t && t[id]?.status === 'resolved' })
+  const askJury = async (id) => {
+    if (!account) { notify('Connect a wallet first.', 'error'); return }
+    setBusy('jury asked')
+    setTx({ phase: 'PENDING' })
+    try {
+      await writeContract(account, 'resolve_task', [id], 0n, phase => setTx({ phase }))
+      await pollForChange(async () => { const t = await readTree(); return t && t[id]?.status === 'resolved' })
+      await load(rootId)
+      setBoardReload(k => k + 1)
+      notify('Jury asked.', 'success')
+
+      // Reasoning no longer arrives with the verdict, strict_eq can't
+      // reliably converge on free text across independent validators, so
+      // the explanation is a second, separate transaction now
+      // (explain_task). Chained automatically here so it still just
+      // appears the way it always did, rather than becoming an extra
+      // step someone has to discover on their own.
+      setBusy('getting the reasoning')
+      setTx({ phase: 'PENDING' })
+      try {
+        await writeContract(account, 'explain_task', [id], 0n, phase => setTx({ phase }))
+        await load(rootId)
+        setTx({ phase: 'done' })
+      } catch (e) {
+        // The verdict and payout already succeeded and are final. A
+        // failure here only means the reasoning sentence didn't get
+        // written, nothing financial is at risk, so this fails quietly
+        // rather than reads as an alarm about the transaction itself.
+        setTx(null)
+        notify('Verdict is in and paid out. Could not generate the explanation, retry it from the task.', 'info')
+      }
+      setForm(null)
+    } catch (e) {
+      const { text, type } = friendlyError(e)
+      setTx({ phase: 'failed', error: text, retry: () => askJury(id) })
+      notify(text, type)
+    } finally { setBusy('') }
+  }
+
+  const explainAgain = (id) =>
+    send('explanation updated', 'explain_task', [id], 0n, null)
+
+  const sendMessage = (id, text, onDone) => {
+    setSendingMsgId(id)
+    writeContract(account, 'send_message', [id, text], 0n)
+      .then(() => { onDone(); })
+      .catch(e => { const { text: t, type } = friendlyError(e); notify(t, type) })
+      .finally(() => setSendingMsgId(''))
+  }
 
   const pull = (id) =>
     send('submission pulled', 'withdraw_deliverable', [id], 0n,
@@ -256,6 +304,10 @@ export default function App() {
     if (isAgent && t.status === 'submitted') A.push(['Pull submission', () => pull(id), false])
     if (isBuyer && t.status === 'submitted' && kidsDone) A.push(['Ask the jury', () => askJury(id), true])
     if (isBuyer && t.status === 'posted' && kidsReclaimed) A.push(['Take it back', () => takeBack(id), false])
+    // Fallback for the rare case the automatic explain_task call after
+    // resolve_task didn't go through, either side can retry it, it moves
+    // no money, so no reason to gate it to just the buyer.
+    if ((isAgent || isBuyer) && t.status === 'resolved' && !t.reasoning) A.push(['Get the reasoning', () => explainAgain(id), false])
 
     // Resolve is buyer-only now. Without this, an agent who's submitted
     // and is just waiting sees an empty action row with no explanation,
@@ -276,6 +328,16 @@ export default function App() {
       </>
     )
   }
+
+  const messages = (id, t) => (
+    <Messages
+      taskId={id}
+      account={account}
+      isParty={!!account && (account === t.buyer || account === t.agent)}
+      onSend={sendMessage}
+      sending={sendingMsgId === id ? 'Sending' : ''}
+    />
+  )
 
   const L = flat ? ledger(flat) : null
   const goPost = () => { setView('job'); setForm({ kind: 'post' }); window.scrollTo({ top: 0, behavior: 'smooth' }) }
@@ -527,7 +589,7 @@ export default function App() {
             </div>
           )}
         >
-          <CascadeTree flat={flat} actions={actions} />
+          <CascadeTree flat={flat} actions={actions} messages={messages} />
         </Panel>
 
         {L && L.rootResolved && (

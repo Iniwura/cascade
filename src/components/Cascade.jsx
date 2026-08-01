@@ -38,7 +38,7 @@ export function Vessel({ score }) {
   )
 }
 
-function TaskCard({ id, task, actions }) {
+function TaskCard({ id, task, actions, messages }) {
   const role = task.parent_id === '' ? 'ROOT' : 'HANDED OFF'
   const resolved = task.status === 'resolved'
   const held = Number(task.self_allocated)
@@ -90,33 +90,35 @@ function TaskCard({ id, task, actions }) {
         <div className="card-url">{task.deliverable_url}</div>
       )}
 
+      {messages && messages(id, task)}
+
       {actions && <div className="card-acts">{actions(id, task)}</div>}
     </div>
   )
 }
 
-function Node({ flat, id, actions }) {
+function Node({ flat, id, actions, messages }) {
   const task = flat[id]
   if (!task) return null
   const kids = [...(task.children || [])].sort((a, b) => Number(a) - Number(b))
   return (
     <div className="tree-node">
-      <TaskCard id={id} task={task} actions={actions} />
+      <TaskCard id={id} task={task} actions={actions} messages={messages} />
       {kids.length > 0 && (
         <div className="tree-children">
-          {kids.map(cid => <Node key={cid} flat={flat} id={cid} actions={actions} />)}
+          {kids.map(cid => <Node key={cid} flat={flat} id={cid} actions={actions} messages={messages} />)}
         </div>
       )}
     </div>
   )
 }
 
-export default function CascadeTree({ flat, actions }) {
+export default function CascadeTree({ flat, actions, messages }) {
   if (!flat) return (
     <p style={{ color: 'var(--ink-faint)', fontSize: 13 }}>
       Nothing here yet. Post the first job to see it appear right here.
     </p>
   )
   const rootId = rootIdOf(flat)
-  return <Node flat={flat} id={rootId} actions={actions} />
+  return <Node flat={flat} id={rootId} actions={actions} messages={messages} />
 }

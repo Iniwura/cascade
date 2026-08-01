@@ -5,8 +5,8 @@ sides agreed to, and releases exactly that share of the escrow. Hand a
 piece of the job to another agent and the same thing happens one level
 down. Nobody is paid for work they didn't do. Nothing gets stuck.
 
-Contract: `0xf529b1f12475bFcA9445B20337A790e5c92Aaec1` on GenLayer Bradbury
-Explorer: https://explorer-bradbury.genlayer.com/address/0xf529b1f12475bFcA9445B20337A790e5c92Aaec1
+Contract: `0xC2579Dbd6326977Bc9F46939Cf92F29633d52a27` on GenLayer Bradbury
+Explorer: https://explorer-bradbury.genlayer.com/address/0xC2579Dbd6326977Bc9F46939Cf92F29633d52a27
 
 ## Run
 
@@ -184,4 +184,39 @@ src/
 - **Open marketplace claiming has no self-claim guard.** A buyer can
   currently claim their own posted job. Not exploitable, it's their own
   escrow and the jury still grades honestly, but it was never a
-  deliberate decision, just an unaddressed edge case.
+  deliberate decision, just an unaddressed edge case.## The grading mechanism was reworked, live-verified
+
+Validators previously only checked that a verdict was well-formed
+(`LABEL||reason`, right shape), never whether the label itself was
+actually justified, a real, reviewer-flagged weakness. The verdict is now
+decided by `gl.eq_principle.strict_eq` over a single constrained word,
+every validator independently fetches the evidence, independently judges
+it, and must land on the byte-identical answer for the transaction to
+commit. That's genuine independent verification, not a format check.
+
+Free text will never come back byte-identical across independent models
+even when they agree on substance, so the reasoning was split into its
+own separate call, `explain_task`, which runs automatically right after
+`resolve_task` succeeds (chained client-side, two transactions, one user
+action). It moves no money and changes no stored score, generating the
+explanation for an already-decided verdict. If that second call fails,
+the verdict and payout are already final and unaffected, a "Get the
+reasoning" fallback action appears on the task if `reasoning` is empty.
+
+Confirmed live: `strict_eq` converges reliably on this prompt shape, a
+task correctly scored `FULL` end to end, claim through explanation, real
+GEN moved to the wei.
+
+## Messaging, real transactions, not a chat replacement
+
+`send_message` / `get_messages`, gated to just the buyer and agent on a
+given task. Plain storage, no AI, no consensus call, this doesn't touch
+the thing that makes GenLayer worth building on, it's a cheap
+clarification channel for a real, recurring need: asking a question
+about scope before or after work is submitted. Every message is a real
+transaction, gas cost per line, permanently public, no edits or deletes,
+worth knowing before this gets used as general chat.
+
+## Restructured into three real tabs
+
+

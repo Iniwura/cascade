@@ -10,7 +10,7 @@ import { TransactionStatus } from 'genlayer-js/types'
 
 export { TransactionStatus }
 
-export const CONTRACT = '0xf529b1f12475bFcA9445B20337A790e5c92Aaec1'
+export const CONTRACT = '0xC2579Dbd6326977Bc9F46939Cf92F29633d52a27'
 export const DEMO_ROOT = '0'
 
 export const CHAIN_ID = '0x107D'

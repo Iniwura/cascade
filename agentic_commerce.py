@@ -22,6 +22,8 @@ class AgenticCommerce(gl.Contract):
     agent_tags:   TreeMap[str, str]   # address -> comma-separated self-declared tags
     usernames:      TreeMap[str, str] # address -> claimed username
     username_index: TreeMap[str, str] # lowercased username -> address
+    message_counts: TreeMap[str, str] # task_id -> str(int) number of messages on that task
+    messages:       TreeMap[str, str] # "task_id:index" -> JSON {sender, text}
 
     def __init__(self):
         self.task_counter = u64(0)
@@ -79,6 +81,7 @@ class AgenticCommerce(gl.Contract):
             "deliverable_url":   "",
             "status":            "posted",
             "score":             -1,
+            "band":              "",
             "realized":          -1,
             "fetched":           False,
             "reasoning":         "",
@@ -131,6 +134,7 @@ class AgenticCommerce(gl.Contract):
             "deliverable_url":   "",
             "status":            "posted",
             "score":             -1,
+            "band":              "",
             "realized":          -1,
             "fetched":           False,
             "reasoning":         "",
@@ -299,10 +303,22 @@ class AgenticCommerce(gl.Contract):
                         )
 
                 if not any_ok:
-                    return "FETCH_FAILED||None of the deliverable URLs could be fetched."
+                    return "FETCH_FAILED"
 
                 content = "\n".join(sections)
 
+                # Constrained to a single word on purpose. This is the fix
+                # for validators only checking output format instead of the
+                # actual outcome: strict_eq requires every validator to
+                # independently fetch the evidence, independently judge it,
+                # and land on the byte-identical answer, real verification,
+                # not a format check on a leader's claim. That only works
+                # reliably against a tiny output space, which is why the
+                # explanation is generated separately, in explain_task, by
+                # a different consensus mechanism entirely. Free text will
+                # never come back identical across five different models
+                # even when they substantively agree, so it can never be
+                # the thing strict_eq is asked to check.
                 prompt = (
                     "You are grading delivered work against an agreed spec. Be strict: "
                     "only award a higher band when the deliverable clearly demonstrates "
@@ -315,57 +331,28 @@ class AgenticCommerce(gl.Contract):
                     "against the delivered content. A requirement only counts as met if "
                     "you can point to something specific in the content that satisfies it. "
                     "A requirement you cannot find evidence for counts as unmet, not as "
-                    "probably-fine.\n\n"
-                    "Choose EXACTLY ONE label:\n"
-                    "  FULL        : every concrete requirement in the spec is clearly met\n"
-                    "  MINOR_GAPS  : nearly all requirements met, only small or cosmetic gaps\n"
-                    "  PARTIAL     : some requirements clearly met, others clearly missing\n"
-                    "  TANGENTIAL  : loosely related, most requirements unmet\n"
-                    "  UNRELATED   : unrelated to the spec, or no usable content\n\n"
-                    "Judge ONLY against the spec above. Do not reward quality the spec "
-                    "did not ask for, and do not penalize omissions it did not require. "
-                    "If a deliverable is an error page, a navigation menu, or a table of "
-                    "contents rather than real work, treat it as not fetched for that item.\n\n"
-                    "Reply on ONE line, exactly this format, nothing else:\n"
-                    "LABEL||<one short sentence citing specific evidence from the content>"
+                    "probably-fine. If a deliverable is an error page, a navigation menu, "
+                    "or a table of contents rather than real work, treat it as not fetched "
+                    "for that item.\n\n"
+                    "FULL        : every concrete requirement in the spec is clearly met\n"
+                    "MINOR_GAPS  : nearly all requirements met, only small or cosmetic gaps\n"
+                    "PARTIAL     : some requirements clearly met, others clearly missing\n"
+                    "TANGENTIAL  : loosely related, most requirements unmet\n"
+                    "UNRELATED   : unrelated to the spec, or no usable content\n\n"
+                    "Reply with EXACTLY one word and nothing else, no punctuation, no "
+                    "explanation: FULL, MINOR_GAPS, PARTIAL, TANGENTIAL, or UNRELATED."
                 )
 
-                result = str(gl.nondet.exec_prompt(prompt)).strip()
-
-                head = result.split("||")[0].strip().upper()
+                result = str(gl.nondet.exec_prompt(prompt)).strip().upper()
                 for band in ("FULL", "MINOR_GAPS", "PARTIAL", "TANGENTIAL", "UNRELATED"):
-                    if band in head:
-                        reason = result.split("||", 1)[1].strip()[:400] if "||" in result else ""
-                        if not reason:
-                            reason = "No reasoning given."
-                        return band + "||" + reason
-                return "GRADER_FAILED||Grader returned an unusable label: " + result[:150]
+                    if band == result or result.startswith(band):
+                        return band
+                return "GRADER_FAILED"
 
-            except Exception as e:
-                return "GRADER_FAILED||" + type(e).__name__ + ": " + str(e)[:200]
+            except Exception:
+                return "GRADER_FAILED"
 
-        raw_result = gl.eq_principle.prompt_non_comparative(
-            judge,
-            # Written for the VALIDATOR, not the leader. Validators see this
-            # alongside the leader's output and nothing else. Leader-facing
-            # phrasing makes them try to grade the leader's output as if it
-            # were the deliverable, then reject it for containing no work.
-            task=(
-                "A grader read one or more web pages and classified how well they "
-                "satisfy a spec together, returning one label and a short reason. You "
-                "are only checking the format of that response. You cannot see the "
-                "pages or the spec, so do not attempt to re-grade anything."
-            ),
-            # Mechanical only. Validators must AGREE with each other, so every
-            # clause has to be objectively decidable. Asking them to judge
-            # whether a score "follows from" its reasoning is a judgment call:
-            # they disagree, consensus fails, nothing commits.
-            criteria=(
-                "Accept if the response begins with one of FULL, MINOR_GAPS, PARTIAL, "
-                "TANGENTIAL, UNRELATED, FETCH_FAILED, or GRADER_FAILED, followed by "
-                "two pipe characters and then any non-empty text."
-            ),
-        )
+        band = gl.eq_principle.strict_eq(judge)
 
         BANDS = {
             "FULL":       95,
@@ -375,22 +362,16 @@ class AgenticCommerce(gl.Contract):
             "UNRELATED":   5,
         }
 
-        raw       = str(raw_result).strip()
-        band      = raw.split("||")[0].strip().upper()
-        reasoning = raw.split("||", 1)[1].strip()[:400] if "||" in raw else ""
-
         # Neither a dead link nor a broken grader is a verdict on the work.
         # Refusing to resolve leaves the task submitted so it can be retried,
         # rather than permanently zeroing an agent because a page was down.
         if band == "FETCH_FAILED":
             raise gl.vm.UserError(
-                "Could not fetch deliverable: " + reasoning + " | task left submitted, retry resolve"
+                "Could not fetch one or more deliverables, task left submitted, retry resolve"
             )
         if band not in BANDS:
-            # Carries the real exception text out of the nondet block so the
-            # explorer shows what actually threw.
             raise gl.vm.UserError(
-                "Grader failed: " + reasoning + " | task left submitted, retry resolve"
+                "Grader did not return a usable verdict, task left submitted, retry resolve"
             )
 
         fetched = True
@@ -407,10 +388,10 @@ class AgenticCommerce(gl.Contract):
         self.unspent_pool[root_id] = str(pool + shortfall)
 
         task["score"]     = score
-        task["realized"]  = realized
+        task["band"]      = band
         task["status"]    = "resolved"
         task["fetched"]   = fetched
-        task["reasoning"] = reasoning
+        task["realized"]  = realized
         self._save_task(task_id, task)
 
         if task["parent_id"] == "":
@@ -419,6 +400,92 @@ class AgenticCommerce(gl.Contract):
             if refund > 0:
                 _Recipient(Address(buyer)).emit_transfer(value=refund)
                 self.unspent_pool[task_id] = "0"
+
+    # ── Explanation ──────────────────────────────────────────
+    #
+    # Deliberately a second, separate transaction, not folded into
+    # resolve_task above. Two eq_principle calls inside one function, even
+    # sequential and non-nested, is not a pattern confirmed safe anywhere
+    # in this codebase, and the one documented failure mode for stacking
+    # consensus calls in a single execution path is a silent exit_code 1.
+    # Splitting into two calls costs an extra transaction but is built
+    # entirely on patterns already proven live.
+    #
+    # This moves no money and changes no stored score. It exists purely to
+    # produce the human-readable reasoning, which is real product value,
+    # just never the thing that needed independent verification. Anyone
+    # can call it once a task is resolved, callable more than once if the
+    # first explanation reads poorly, each call overwrites the last.
+
+    @gl.public.write
+    def explain_task(self, task_id: str):
+        task = self._get_task(task_id)
+        if task["status"] != "resolved":
+            raise gl.vm.UserError("task is " + task["status"] + ", nothing to explain yet")
+
+        spec       = task["spec"]
+        url_list   = [u.strip() for u in task["deliverable_url"].split(",") if u.strip()]
+        band       = task["band"]
+
+        def judge() -> str:
+            try:
+                def fetch_one(u):
+                    try:
+                        resp = gl.nondet.web.request(u, method="GET")
+                    except:
+                        return None
+                    raw_body = None
+                    for name in ("body", "text", "content", "data"):
+                        if hasattr(resp, name):
+                            raw_body = getattr(resp, name)
+                            break
+                    if raw_body is None:
+                        return None
+                    full = raw_body.decode("utf-8") if isinstance(raw_body, bytes) else str(raw_body)
+                    return full if full.strip() else None
+
+                n = len(url_list)
+                per_file_budget = max(1500, 8000 // max(1, n))
+                sections = []
+                for i in range(n):
+                    full = fetch_one(url_list[i])
+                    if full:
+                        sections.append(full[:per_file_budget])
+                content = "\n\n".join(sections) if sections else "(deliverable could not be re-fetched)"
+
+                prompt = (
+                    "A piece of delivered work was already graded against a spec, and the "
+                    "verdict was " + band + ". Your only job is to explain, in one short "
+                    "sentence, why this specific deliverable earned that specific verdict. "
+                    "Cite something concrete from the content below. Do not propose a "
+                    "different verdict, the grading is already final.\n\n"
+                    "SPEC:\n" + spec + "\n\n"
+                    "VERDICT ALREADY GIVEN: " + band + "\n\n"
+                    "DELIVERED CONTENT:\n" + content + "\n\n"
+                    "Reply with one sentence, nothing else."
+                )
+                text = str(gl.nondet.exec_prompt(prompt)).strip()[:400]
+                return text if text else "No reasoning could be generated."
+            except Exception:
+                return "No reasoning could be generated."
+
+        # Free text, checked only for being present and reasonably short.
+        # This is exactly the kind of open-ended content prompt_non_comparative
+        # was meant for, format-only agreement is the correct bar here
+        # because nothing downstream depends on the wording matching
+        # exactly, unlike the verdict itself above.
+        explanation = gl.eq_principle.prompt_non_comparative(
+            judge,
+            task=(
+                "A grader wrote one sentence explaining an already-decided verdict on a "
+                "piece of work. You are only checking that a real sentence was returned, "
+                "you cannot see the deliverable or the spec."
+            ),
+            criteria="Accept any non-empty text under 500 characters that is not just punctuation or whitespace.",
+        )
+
+        task["reasoning"] = str(explanation).strip()[:400]
+        self._save_task(task_id, task)
 
     # ── Exits ────────────────────────────────────────────────
     #
@@ -478,6 +545,43 @@ class AgenticCommerce(gl.Contract):
             parent = self._get_task(parent_id)
             parent["self_allocated"] += amount
             self._save_task(parent_id, parent)
+
+    # ── Messages ─────────────────────────────────────────────
+    #
+    # Plain storage, no AI, no consensus call, deliberately. This doesn't
+    # touch the thing that makes GenLayer worth building on, it's just a
+    # cheap request-for-clarification channel between the two people
+    # already party to a task. Gated to buyer/agent only, not open to
+    # anyone, and every message is a real transaction: gas cost per line,
+    # permanently public, no edits or deletes. Worth knowing before this
+    # gets used as a general chat, it isn't Discord.
+
+    @gl.public.write
+    def send_message(self, task_id: str, text: str):
+        task = self._get_task(task_id)
+        sender = self._addr()
+        if sender != task["buyer"] and sender != task["agent"]:
+            raise gl.vm.UserError("only the buyer or agent for this task can send a message")
+        clean = text.strip()
+        if not clean:
+            raise gl.vm.UserError("message cannot be empty")
+        if len(clean) > 500:
+            raise gl.vm.UserError("message must be 500 characters or fewer")
+
+        count = int(self.message_counts.get(task_id, "0"))
+        key = task_id + ":" + str(count)
+        self.messages[key] = json.dumps({"sender": sender, "text": clean})
+        self.message_counts[task_id] = str(count + 1)
+
+    @gl.public.view
+    def get_messages(self, task_id: str) -> str:
+        count = int(self.message_counts.get(task_id, "0"))
+        result = []
+        for i in range(count):
+            raw = self.messages.get(task_id + ":" + str(i), None)
+            if raw:
+                result.append(json.loads(raw))
+        return json.dumps(result)
 
     # ── Views ────────────────────────────────────────────────
 
