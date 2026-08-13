@@ -1,1 +1,1 @@
-A practical GenLayer Intelligent Contract use case is automated escrow resolution where validators independently inspect submitted evidence and agree on a payout band before funds are released.
+This content was changed after the original Cascade submission.
