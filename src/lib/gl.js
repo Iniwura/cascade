@@ -10,7 +10,7 @@ import { TransactionStatus } from 'genlayer-js/types'
 
 export { TransactionStatus }
 
-export const CONTRACT = '0xC2579Dbd6326977Bc9F46939Cf92F29633d52a27'
+export const CONTRACT = '0x70aC19F76108e2e4B9256e9DB2972F15b753f509'
 export const DEMO_ROOT = '0'
 
 export const CHAIN_ID = '0x107D'
@@ -175,6 +175,26 @@ export function genToWeiString(gen) {
   const n = parseFloat(gen)
   if (!isFinite(n) || n <= 0) throw new Error('amount must be greater than zero')
   return BigInt(Math.round(n * 1e18)).toString()
+}
+
+// Must match the contract's canonical evidence encoding exactly:
+// an ordered JSON array containing each fetched response body, UTF-8 encoded,
+// then SHA-256 hashed. URLs are stored separately; the commitment binds the
+// bytes the jury will later fetch and grade.
+export async function createEvidenceCommitment(urls) {
+  const contents = []
+  for (const url of urls) {
+    const response = await fetch(url)
+    if (!response.ok) throw new Error('Could not fetch deliverable: HTTP ' + response.status)
+    contents.push(await response.text())
+  }
+  const canonical = new TextEncoder().encode(JSON.stringify(contents))
+  const digest = await crypto.subtle.digest('SHA-256', canonical)
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+
+export function isTimeoutEligible(task, nowMs = Date.now()) {
+  return task?.status === 'submitted' && Number(task.resolution_deadline || 0) * 1000 <= nowMs
 }
 
 // list_roots returns newest-first, so the first entry is reliably the

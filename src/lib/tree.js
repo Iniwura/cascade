@@ -47,9 +47,20 @@ export function flatten(flat, rootId, depth = 0, out = [], isLast = true) {
   const t = flat[rootId]
   if (!t) return out
   out.push({ id: rootId, depth, task: t, isLast })
-  const kids = [...(t.children || [])].sort((a, b) => Number(a) - Number(b))
+  const kids = [...(t.children || []), ...(t.delegation_proposals || [])]
+    .sort((a, b) => Number(a) - Number(b))
   kids.forEach((cid, i) => flatten(flat, cid, depth + 1, out, i === kids.length - 1))
   return out
+}
+
+export function taskStatusLabel(task, nowMs = Date.now()) {
+  if (task.status === 'proposed') return 'AWAITING BUYER APPROVAL'
+  if (task.status === 'submitted') {
+    return Number(task.resolution_deadline || 0) * 1000 <= nowMs
+      ? 'TIMEOUT ELIGIBLE'
+      : 'AWAITING RESOLUTION'
+  }
+  return String(task.status || '').toUpperCase()
 }
 
 // The ledger. This is the product's whole claim, so it is computed from

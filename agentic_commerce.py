@@ -1,5 +1,7 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 import json
+import hashlib
+from datetime import datetime, timezone
 from genlayer import *
 
 
@@ -13,6 +15,8 @@ class _Recipient:
 
 
 class AgenticCommerce(gl.Contract):
+
+    RESOLUTION_WINDOW_SECONDS = 7 * 24 * 60 * 60
 
     task_counter: u64
     tasks:        TreeMap[str, str]   # JSON-encoded task dict
@@ -50,6 +54,9 @@ class AgenticCommerce(gl.Contract):
             t = self._get_task(current)
         return current
 
+    def _now(self) -> int:
+        return int(datetime.now(timezone.utc).timestamp())
+
     # ── Creation ─────────────────────────────────────────────
     #
     # agent may be "" at creation. An empty agent means the task is open:
@@ -78,7 +85,11 @@ class AgenticCommerce(gl.Contract):
             "payout_allocated":  payout,
             "self_allocated":    payout,
             "children":          [],
+            "delegation_proposals": [],
             "deliverable_url":   "",
+            "evidence_commitment": "",
+            "submitted_at":      0,
+            "resolution_deadline": 0,
             "status":            "posted",
             "score":             -1,
             "band":              "",
@@ -93,7 +104,7 @@ class AgenticCommerce(gl.Contract):
         return task_id
 
     @gl.public.write
-    def subcontract(self, parent_id: str, spec: str, agent: str, amount: str, tags: str) -> str:
+    def propose_subcontract(self, parent_id: str, spec: str, agent: str, amount: str, tags: str) -> str:
         # amount is a STRING, not an int. Wei values are ~1e18, past JavaScript's
         # safe integer limit (~9e15), so a client sending an int param mangles
         # it. This bit three separate tree tests: 1000000000000000000 arrived as
@@ -110,29 +121,38 @@ class AgenticCommerce(gl.Contract):
         parent = self._get_task(parent_id)
         if self._addr() != parent["agent"]:
             raise gl.vm.UserError("not the agent for this task")
-        if parent["status"] not in ("posted", "submitted"):
-            raise gl.vm.UserError("parent task is " + parent["status"] + ", cannot subcontract")
+        if parent["status"] != "posted":
+            raise gl.vm.UserError("parent task is " + parent["status"] + ", cannot propose delegation")
         if amt > parent["self_allocated"]:
             raise gl.vm.UserError("exceeds unallocated balance")
+
+        proposed_agent = agent.lower().strip()
+        if not proposed_agent:
+            raise gl.vm.UserError("proposed subcontractor is required")
 
         child_id = str(int(self.task_counter))
         self.task_counter = u64(int(self.task_counter) + 1)
 
-        parent["self_allocated"] -= amt
-        parent["children"].append(child_id)
+        # A proposal is visible but economically inert until the root buyer
+        # approves these exact stored terms.
+        parent["delegation_proposals"].append(child_id)
         self._save_task(parent_id, parent)
 
         child = {
             "parent_id":        parent_id,
             "buyer":             parent["buyer"],
-            "agent":             agent.lower().strip(),
+            "agent":             proposed_agent,
             "spec":              spec,
             "tags":              tags.strip(),
             "payout_allocated":  amt,
             "self_allocated":    amt,
             "children":          [],
+            "delegation_proposals": [],
             "deliverable_url":   "",
-            "status":            "posted",
+            "evidence_commitment": "",
+            "submitted_at":      0,
+            "resolution_deadline": 0,
+            "status":            "proposed",
             "score":             -1,
             "band":              "",
             "realized":          -1,
@@ -141,6 +161,35 @@ class AgenticCommerce(gl.Contract):
         }
         self._save_task(child_id, child)
         return child_id
+
+    @gl.public.write
+    def approve_subcontract(self, proposal_id: str):
+        child = self._get_task(proposal_id)
+        if child["status"] != "proposed":
+            raise gl.vm.UserError("delegation proposal is " + child["status"])
+
+        parent_id = child["parent_id"]
+        if not parent_id:
+            raise gl.vm.UserError("root tasks are not delegation proposals")
+        root_id = self._find_root(parent_id)
+        if self._addr() != self.root_buyer[root_id]:
+            raise gl.vm.UserError("only the root buyer can approve delegation")
+
+        parent = self._get_task(parent_id)
+        if parent["status"] != "posted":
+            raise gl.vm.UserError("parent task is " + parent["status"] + ", cannot approve delegation")
+        amount = int(child["payout_allocated"])
+        if amount > int(parent["self_allocated"]):
+            raise gl.vm.UserError("parent no longer has enough unallocated balance")
+
+        parent["self_allocated"] -= amount
+        parent["delegation_proposals"] = [
+            pid for pid in parent["delegation_proposals"] if pid != proposal_id
+        ]
+        parent["children"].append(proposal_id)
+        self._save_task(parent_id, parent)
+        child["status"] = "posted"
+        self._save_task(proposal_id, child)
 
     @gl.public.write
     def claim_task(self, task_id: str):
@@ -189,17 +238,32 @@ class AgenticCommerce(gl.Contract):
     # ── Delivery ─────────────────────────────────────────────
 
     @gl.public.write
-    def submit_deliverable(self, task_id: str, urls: str):
+    def submit_deliverable(self, task_id: str, urls: str, evidence_commitment: str):
         task = self._get_task(task_id)
         if self._addr() != task["agent"]:
             raise gl.vm.UserError("not the agent for this task")
+        if task["status"] != "posted":
+            raise gl.vm.UserError(
+                "task is " + task["status"] + ", cannot submit deliverable"
+            )
         url_list = [u.strip() for u in urls.split(",") if u.strip()]
         if not url_list:
             raise gl.vm.UserError("provide at least one deliverable URL")
         if len(url_list) > 3:
             raise gl.vm.UserError("at most 3 deliverable URLs per submission")
-        task["deliverable_url"] = ",".join(url_list)
-        task["status"]          = "submitted"
+        commitment = evidence_commitment.lower().strip()
+        if len(commitment) != 64:
+            raise gl.vm.UserError("evidence commitment must be a SHA-256 hex digest")
+        for ch in commitment:
+            if ch not in "0123456789abcdef":
+                raise gl.vm.UserError("evidence commitment must be a SHA-256 hex digest")
+
+        submitted_at = self._now()
+        task["deliverable_url"]     = ",".join(url_list)
+        task["evidence_commitment"] = commitment
+        task["submitted_at"]        = submitted_at
+        task["resolution_deadline"] = submitted_at + self.RESOLUTION_WINDOW_SECONDS
+        task["status"]              = "submitted"
         self._save_task(task_id, task)
 
     # ── Resolution ───────────────────────────────────────────
@@ -207,14 +271,20 @@ class AgenticCommerce(gl.Contract):
     @gl.public.write
     def resolve_task(self, task_id: str):
         task = self._get_task(task_id)
-        # Buyer-only, deliberately. Confirmed tradeoff: if the buyer goes
-        # quiet after work is submitted, the agent has no path to being
-        # paid, there is no reliable clock here to force a timeout, the
-        # same limit already accepted for withdraw/reclaim. This is meant
-        # to hold only until real dispute rights (grade, hold, finalize)
-        # replace it, not as a permanent design.
         if self._addr() != task["buyer"]:
             raise gl.vm.UserError("only the buyer can ask the jury to resolve this task")
+        self._settle_task(task_id, task)
+
+    @gl.public.write
+    def settle_after_timeout(self, task_id: str):
+        task = self._get_task(task_id)
+        if task["status"] != "submitted":
+            raise gl.vm.UserError("deliverable not submitted or task already settled")
+        if self._now() < int(task["resolution_deadline"]):
+            raise gl.vm.UserError("resolution deadline has not passed")
+        self._settle_task(task_id, task)
+
+    def _settle_task(self, task_id: str, task: dict):
         if task["status"] != "submitted":
             raise gl.vm.UserError("deliverable not submitted yet")
         for child_id in task["children"]:
@@ -224,6 +294,7 @@ class AgenticCommerce(gl.Contract):
 
         spec           = task["spec"]
         url_list       = [u.strip() for u in task["deliverable_url"].split(",") if u.strip()]
+        commitment     = task["evidence_commitment"]
         agent_addr     = task["agent"]
         self_allocated = task["self_allocated"]
 
@@ -280,17 +351,14 @@ class AgenticCommerce(gl.Contract):
                 per_file_budget = max(1500, 8000 // max(1, n))
 
                 sections = []
-                any_ok = False
+                full_contents = []
                 for i in range(n):
                     u = url_list[i]
                     full, err = fetch_one(u)
                     if full is None:
-                        sections.append(
-                            "--- deliverable " + str(i + 1) + " (" + u + ") ---\n"
-                            "[could not grade this one: " + err + "]\n"
-                        )
+                        return "EVIDENCE_FETCH_FAILED"
                     else:
-                        any_ok = True
+                        full_contents.append(full)
                         note = ""
                         if len(full) > per_file_budget:
                             note = (
@@ -302,8 +370,15 @@ class AgenticCommerce(gl.Contract):
                             + full[:per_file_budget] + "\n"
                         )
 
-                if not any_ok:
-                    return "FETCH_FAILED"
+                actual_commitment = hashlib.sha256(
+                    json.dumps(
+                        full_contents,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if actual_commitment != commitment:
+                    return "EVIDENCE_MISMATCH"
 
                 content = "\n".join(sections)
 
@@ -365,9 +440,13 @@ class AgenticCommerce(gl.Contract):
         # Neither a dead link nor a broken grader is a verdict on the work.
         # Refusing to resolve leaves the task submitted so it can be retried,
         # rather than permanently zeroing an agent because a page was down.
-        if band == "FETCH_FAILED":
+        if band == "EVIDENCE_FETCH_FAILED":
             raise gl.vm.UserError(
                 "Could not fetch one or more deliverables, task left submitted, retry resolve"
+            )
+        if band == "EVIDENCE_MISMATCH":
+            raise gl.vm.UserError(
+                "Evidence content does not match the submitted commitment; task left submitted"
             )
         if band not in BANDS:
             raise gl.vm.UserError(
@@ -494,12 +573,12 @@ class AgenticCommerce(gl.Contract):
     # 3 GEN in exactly this state, because the only way out was a resolve path
     # that had stopped working.
     #
-    # Deliberately no timestamp-based timeout. There is no reliable clock here,
-    # and a buyer-only reclaim on submitted work would let a buyer take the
-    # deliverable and then pull the money back. So each side gets an exit that
-    # cannot rug the other: the agent can withdraw their submission, and the
-    # buyer can reclaim only once nothing is submitted. If the agent has
-    # delivered and stands by it, the funds stay put until resolve succeeds.
+    # Submitted work has a deterministic transaction-time deadline, so a
+    # permissionless timeout settlement is available if the buyer never calls
+    # resolve_task. The separate withdraw/reclaim exits still cover posted work:
+    # an agent can withdraw an ungraded submission, and the buyer can reclaim
+    # only once nothing is submitted. A submitted task stays escrowed until
+    # either normal buyer resolution or the same grading path after timeout.
 
     @gl.public.write
     def withdraw_deliverable(self, task_id: str):
@@ -510,6 +589,9 @@ class AgenticCommerce(gl.Contract):
             raise gl.vm.UserError("nothing submitted to withdraw")
         task["status"]          = "posted"
         task["deliverable_url"] = ""
+        task["evidence_commitment"] = ""
+        task["submitted_at"] = 0
+        task["resolution_deadline"] = 0
         self._save_task(task_id, task)
 
     @gl.public.write
@@ -609,6 +691,7 @@ class AgenticCommerce(gl.Contract):
             t = self._get_task(tid)
             result[tid] = t
             stack.extend(t["children"])
+            stack.extend(t.get("delegation_proposals", []))
         return json.dumps(result)
 
     @gl.public.view
