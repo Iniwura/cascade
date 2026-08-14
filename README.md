@@ -5,8 +5,35 @@ sides agreed to, and releases exactly that share of the escrow. Hand a
 piece of the job to another agent and the same thing happens one level
 down. Nobody is paid for work they didn't do. Nothing gets stuck.
 
-Contract: `0xC2579Dbd6326977Bc9F46939Cf92F29633d52a27` on GenLayer Bradbury
-Explorer: https://explorer-bradbury.genlayer.com/address/0xC2579Dbd6326977Bc9F46939Cf92F29633d52a27
+Deployed Cascade candidate: `0x70aC19F76108e2e4B9256e9DB2972F15b753f509` on GenLayer Bradbury
+Explorer: https://explorer-bradbury.genlayer.com/address/0x70aC19F76108e2e4B9256e9DB2972F15b753f509
+
+## Bradbury verification
+
+The Cascade steward fixes were verified live on GenLayer Bradbury. Two
+accepted timestamp-probe transactions produced deterministic UTC times,
+`2026-08-13T19:36:24+00:00` and `2026-08-13T19:41:39+00:00`, confirming that
+`datetime.now(timezone.utc)` advances across transactions.
+
+On the production candidate above, root task `#0` moved from
+`self_allocated = 1000000000000000000` with proposal `1` pending to
+`self_allocated = 800000000000000000` with child `1` active after root-buyer
+approval. The child retained its exact stored spec, agent, amount, and tags.
+
+The child evidence commitment was
+`131a8533a719c8339e5f43c12782e06eb3f81e3498816e6a63ff7135685f8f6e`. After the
+hosted evidence changed, `resolve_task("1")` reached `ACCEPTED` execution with
+`EVIDENCE_MISMATCH`; the task remained `submitted` with no score, verdict, or
+payout.
+
+Timeout was tested separately on temporary contract
+`0xF12dB84Fdc2a6169eE94BBD60aeC8221dF26FF30`, whose only production difference
+was a 180-second resolution window. A submission at `1786664115` produced a
+deadline of `1786664295`; permissionless timeout settlement then graded the
+task `UNRELATED` (5%) and paid `0.005000 GEN` to the agent while returning
+`0.095000 GEN` to the buyer from the `0.100000 GEN` escrow. This temporary
+contract is not production. The production contract keeps the seven-day
+window (`7 * 24 * 60 * 60`).
 
 ## Run
 
@@ -58,14 +85,16 @@ so a verdict is a fill level and a word, never a status colour.
 
 ## Contract reference
 
-Fifteen public methods. Writes:
+Writes:
 
 ```
 create_root_task(spec, agent, tags) -> str      payable. agent="" means open, anyone can claim
-subcontract(parent_id, spec, agent, amount, tags) -> str   amount is a STRING (wei)
+propose_subcontract(parent_id, spec, agent, amount, tags) -> str   inert proposal; amount is a STRING (wei)
+approve_subcontract(proposal_id)                root buyer only; activates the exact stored terms
 claim_task(task_id)                             only works if agent==""
-submit_deliverable(task_id, urls)               urls comma-separated, max 3
-resolve_task(task_id)                           BUYER ONLY, deliberately (see gotchas)
+submit_deliverable(task_id, urls, evidence_commitment)   max 3 URLs plus SHA-256 commitment
+resolve_task(task_id)                           buyer's normal settlement path
+settle_after_timeout(task_id)                   permissionless at/after the stored deadline
 withdraw_deliverable(task_id)                   agent only, while submitted
 reclaim_task(task_id)                           buyer only, while posted, all children must be reclaimed (not resolved)
 set_agent_tags(tags)
@@ -146,13 +175,72 @@ src/
    granular tracking turns out not to work. Console logs the raw poll
    response (`[cascade tx poll]`) for whoever tests this next.
 
+## Steward security model
+
+### Buyer-approved delegation
+
+`propose_subcontract` stores the parent id, subcontractor, spec, wei amount,
+and tags in a child record with status `proposed`. It is visible in `get_tree`,
+but it is not an active child, does not reduce the parent's allocation, and
+cannot be claimed or worked as an active task.
+
+Only the root buyer can call `approve_subcontract`. Approval rechecks the
+parent state and allocation, then activates the exact stored record without
+accepting replacement terms. Recursive proposals follow the parent chain to
+the same root-buyer authority.
+
+### Non-ruggable timeout settlement
+
+Submission stores the deterministic GenVM transaction timestamp as
+`submitted_at` and fixes `resolution_deadline` seven days later. The buyer can
+call `resolve_task` normally. At or after the deadline, any account can call
+`settle_after_timeout`; the contract enforces both the deadline and submitted
+state.
+
+Both entry points use one private settlement routine. It makes exactly one
+`gl.eq_principle.strict_eq` call and preserves the five graduated bands:
+`FULL 95`, `MINOR_GAPS 80`, `PARTIAL 55`, `TANGENTIAL 25`, `UNRELATED 5`.
+Timeout never means automatic success or a 100% release, and a settled task
+cannot settle twice.
+
+### Immutable evidence commitment
+
+Before submitting, the frontend fetches each URL in order, JSON-encodes the
+ordered array of exact response bodies, UTF-8 encodes it, and commits its
+SHA-256 digest. Settlement refetches every body and recomputes the digest
+inside the single strict-equivalence grading call. A fetch failure or mismatch
+leaves the task submitted, unpaid, and unresolved; changed content is never
+silently graded.
+
+This binds content rather than trusting URL identity. It does not make the
+host durable, so stable, publicly fetchable URLs are still required.
+
+## Executable tests
+
+The focused suite uses `genlayer-test` direct execution, public contract
+methods, deterministic time warping, mocked web responses, and mocked jury
+bands:
+
+```powershell
+$env:PYTHONUTF8='1'
+py -m pytest tests/test_steward_integration.py -v
+```
+
+It covers proposal authorization and immutability, recursive root approval,
+timestamps and deadlines, early-timeout rejection, permissionless graduated
+timeout settlement, timeout-first race rejection, duplicate approval without a
+second allocation deduction, pre-approval submission rejection, matching and
+reordered multi-URL evidence, unavailable-host failure, duplicate-settlement
+rejection, and all five payout bands without payment or resolution on failure.
+The direct VM does not model the cross-contract `EthSend` used by
+`emit_transfer`, so balance effects require glsim or a live-network test; this
+suite asserts realized values and escrow accounting instead.
+
 ## Known, on purpose
 
-- **`resolve_task` is buyer-only, and that's a deliberate, temporary
-  tradeoff, not a bug.** If a buyer goes quiet after work is submitted,
-  the agent currently has no path to being paid, there's no reliable
-  on-chain clock here to force a timeout. Holds until real dispute
-  rights (grade, then hold, then finalize) replace it.
+- **Timeout eligibility uses GenVM transaction time.** It is deterministic
+  consensus input for relative deadlines, not validator wall-clock time and
+  not an external web oracle.
 - **Skill tags and usernames are both self-declared and unverified,
   on purpose.** They're discovery aids for the open board, not
   credentials. An unqualified claim already gets punished by the jury
@@ -163,9 +251,9 @@ src/
   Leader missing its execution window, not a contract bug. Nothing
   writes on failure, the task stays `submitted`, retrying is always
   safe and is the designed answer.
-- **The jury reads the first 4,000 characters of each deliverable**,
-  split evenly across however many URLs are submitted (up to 3), so the
-  total budget stays roughly constant regardless of count. Focused
+- **The jury reads a bounded excerpt of each deliverable**, split across
+  however many URLs are submitted (up to 3), so the total budget stays
+  roughly constant regardless of count. Focused
   artifacts grade reliably; a thousand-line file gets sampled, with an
   explicit note in the prompt telling the jury not to penalize that.
 - **`DeliverablePreview` only renders content from sources that allow
@@ -184,7 +272,9 @@ src/
 - **Open marketplace claiming has no self-claim guard.** A buyer can
   currently claim their own posted job. Not exploitable, it's their own
   escrow and the jury still grades honestly, but it was never a
-  deliberate decision, just an unaddressed edge case.## The grading mechanism was reworked, live-verified
+  deliberate decision, just an unaddressed edge case.
+
+## The grading mechanism
 
 Validators previously only checked that a verdict was well-formed
 (`LABEL||reason`, right shape), never whether the label itself was
@@ -203,9 +293,8 @@ explanation for an already-decided verdict. If that second call fails,
 the verdict and payout are already final and unaffected, a "Get the
 reasoning" fallback action appears on the task if `reasoning` is empty.
 
-Confirmed live: `strict_eq` converges reliably on this prompt shape, a
-task correctly scored `FULL` end to end, claim through explanation, real
-GEN moved to the wei.
+The steward changes preserve this mechanism. Their live Bradbury verification
+and the local executable coverage are documented above.
 
 ## Messaging, real transactions, not a chat replacement
 
@@ -218,5 +307,3 @@ transaction, gas cost per line, permanently public, no edits or deletes,
 worth knowing before this gets used as general chat.
 
 ## Restructured into three real tabs
-
-

@@ -1,6 +1,6 @@
 import React from 'react'
 import { Vessel } from './Cascade.jsx'
-import { BANDS } from '../lib/tree.js'
+import { BANDS, taskStatusLabel } from '../lib/tree.js'
 import { fmt, short } from '../lib/gl.js'
 import DeliverablePreview from './DeliverablePreview.jsx'
 
@@ -37,7 +37,7 @@ export default function JobCard({ taskId, task, rootId, role, roleLabel, onOpen 
         {isOpen
           ? <span className="verdict-badge open-badge">OPEN</span>
           : <span className={'verdict-badge ' + (resolved ? 'done' : 'pending')}>
-              {resolved ? (BANDS[task.score] || task.score) : task.status}
+              {resolved ? (BANDS[task.score] || task.score) : taskStatusLabel(task)}
             </span>}
       </div>
       <p className="job-card-spec">{task.spec}</p>
@@ -47,6 +47,12 @@ export default function JobCard({ taskId, task, rootId, role, roleLabel, onOpen 
         </div>
       )}
       <Vessel score={resolved ? task.score : -1} />
+      {task.evidence_commitment && (
+        <div className="evidence-meta compact">
+          <span>evidence {task.evidence_commitment.slice(0, 12)}...</span>
+          <span>deadline {new Date(Number(task.resolution_deadline) * 1000).toLocaleString()}</span>
+        </div>
+      )}
 
       {/* Buyer view: lead with the outcome, what did the money buy. A
           real preview, not just a link, that's the thing a buyer actually

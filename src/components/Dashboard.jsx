@@ -75,14 +75,14 @@ export default function Dashboard({ account, onOpen, onSaveTags, savingTags, onS
       })
     : []
 
-  // The load-bearing one now that resolve is buyer-only: if you don't
-  // act, nothing moves. Separate from the general activity feed on
-  // purpose, this is specifically "you are the bottleneck right now."
-  const awaitingResolution = posted.filter(([, f]) => {
-    const root = f[rootIdOf(f)]
-    if (root.status !== 'submitted') return false
-    return (root.children || []).every(c => ['resolved', 'reclaimed'].includes(f[c]?.status))
-  })
+  const buyerNodes = posted.flatMap(([rid, f]) =>
+    flatten(f, rootIdOf(f)).map(row => ({ rootId: rid, taskId: row.id, task: row.task, flat: f }))
+  )
+  const awaitingDelegation = buyerNodes.filter(n => n.task.status === 'proposed')
+  const awaitingResolution = buyerNodes.filter(n =>
+    n.task.status === 'submitted' &&
+    (n.task.children || []).every(c => ['resolved', 'reclaimed'].includes(n.flat[c]?.status))
+  )
 
   // Buyer-side: money that moved on jobs YOU posted.
   let postedResolved = 0, postedPending = 0, totalEscrowed = 0, earnedByYourAgents = 0, returnedToYou = 0
@@ -150,11 +150,25 @@ export default function Dashboard({ account, onOpen, onSaveTags, savingTags, onS
             <div className="resolve-banner">
               <div className="resolve-banner-head">
                 <strong>{awaitingResolution.length} job{awaitingResolution.length > 1 ? 's' : ''} waiting for you to resolve.</strong>
-                <span>Nothing pays out until you ask the jury.</span>
+                <span>You can resolve now; after the deadline, settlement becomes permissionless.</span>
               </div>
               <div className="job-grid">
-                {awaitingResolution.map(([id, f]) => (
-                  <JobCard key={id} taskId={id} task={f[id]} rootId={id} role="buyer" roleLabel="ready to resolve" onOpen={onOpen} />
+                {awaitingResolution.map(n => (
+                  <JobCard key={n.rootId + ':' + n.taskId} taskId={n.taskId} task={n.task} rootId={n.rootId} role="buyer" roleLabel="ready to resolve" onOpen={onOpen} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {!loading && awaitingDelegation.length > 0 && (
+            <div className="resolve-banner">
+              <div className="resolve-banner-head">
+                <strong>{awaitingDelegation.length} delegation proposal{awaitingDelegation.length > 1 ? 's' : ''} waiting for your approval.</strong>
+                <span>No allocation moves until you approve the exact proposed terms.</span>
+              </div>
+              <div className="job-grid">
+                {awaitingDelegation.map(n => (
+                  <JobCard key={n.rootId + ':' + n.taskId} taskId={n.taskId} task={n.task} rootId={n.rootId} role="buyer" roleLabel="approval required" onOpen={onOpen} />
                 ))}
               </div>
             </div>

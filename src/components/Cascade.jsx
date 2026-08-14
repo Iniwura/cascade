@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { fmt, short } from '../lib/gl.js'
-import { BANDS, flatten, rootIdOf } from '../lib/tree.js'
+import { BANDS, rootIdOf, taskStatusLabel } from '../lib/tree.js'
 import DeliverablePreview from './DeliverablePreview.jsx'
 
 // The vessel. Fill length is the payout, period. Amber for what reached
@@ -39,9 +39,9 @@ export function Vessel({ score }) {
 }
 
 function TaskCard({ id, task, actions, messages }) {
-  const role = task.parent_id === '' ? 'ROOT' : 'HANDED OFF'
+  const role = task.parent_id === '' ? 'ROOT' : task.status === 'proposed' ? 'PROPOSED DELEGATION' : 'APPROVED SUBCONTRACT'
   const resolved = task.status === 'resolved'
-  const held = Number(task.self_allocated)
+  const held = task.status === 'proposed' ? 0 : Number(task.self_allocated)
   const shortfall = resolved ? held - Number(task.realized) : 0
   const isOpen = task.agent === '' && task.status === 'posted'
   const tags = (task.tags || '').split(',').map(t => t.trim()).filter(Boolean)
@@ -55,7 +55,7 @@ function TaskCard({ id, task, actions, messages }) {
           {isOpen && <span className="role-badge open">OPEN</span>}
         </div>
         <span className={'verdict-badge ' + (resolved ? 'done' : 'pending')}>
-          {resolved ? (BANDS[task.score] || task.score) : task.status}
+          {resolved ? (BANDS[task.score] || task.score) : taskStatusLabel(task)}
         </span>
       </div>
 
@@ -70,7 +70,9 @@ function TaskCard({ id, task, actions, messages }) {
       <Vessel score={task.score} />
 
       <div className="card-figures">
-        <div><span className="fig-lbl">held  </span><span className="fig-val">{fmt(held)}</span></div>
+        {task.status === 'proposed'
+          ? <div><span className="fig-lbl">proposed  </span><span className="fig-val">{fmt(task.payout_allocated)}</span></div>
+          : <div><span className="fig-lbl">held  </span><span className="fig-val">{fmt(held)}</span></div>}
         {resolved && Number(task.realized) > 0 && (
           <div><span className="fig-lbl">earned  </span><span className="fig-val earned">{fmt(task.realized)}</span></div>
         )}
@@ -87,7 +89,14 @@ function TaskCard({ id, task, actions, messages }) {
         <div className="card-reasoning">&ldquo;{task.reasoning}&rdquo;</div>
       )}
       {!resolved && task.deliverable_url && (
-        <div className="card-url">{task.deliverable_url}</div>
+        <>
+          <div className="card-url">{task.deliverable_url}</div>
+          <div className="evidence-meta">
+            <span>SHA-256 {task.evidence_commitment}</span>
+            <span>submitted {new Date(Number(task.submitted_at) * 1000).toLocaleString()}</span>
+            <span>resolution deadline {new Date(Number(task.resolution_deadline) * 1000).toLocaleString()}</span>
+          </div>
+        </>
       )}
 
       {messages && messages(id, task)}
@@ -100,7 +109,8 @@ function TaskCard({ id, task, actions, messages }) {
 function Node({ flat, id, actions, messages }) {
   const task = flat[id]
   if (!task) return null
-  const kids = [...(task.children || [])].sort((a, b) => Number(a) - Number(b))
+  const kids = [...(task.children || []), ...(task.delegation_proposals || [])]
+    .sort((a, b) => Number(a) - Number(b))
   return (
     <div className="tree-node">
       <TaskCard id={id} task={task} actions={actions} messages={messages} />

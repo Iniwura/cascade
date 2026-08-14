@@ -17,6 +17,7 @@ import { getKnownJobs, addKnownJob } from './lib/jobIndex.js'
 import {
   readContract, writeContract, pollForChange, latestRootId,
   genToWeiString, fmt, short, isAddress, resolveAgentInput,
+  createEvidenceCommitment, isTimeoutEligible,
   CONTRACT, DEMO_ROOT, CHAIN_ID, NET, EXPLORER,
 } from './lib/gl.js'
 
@@ -35,6 +36,8 @@ function friendlyError(e) {
     return { text: 'The jury did not answer in time. Nothing changed on chain, try again.', type: 'error' }
   if (/Could not fetch deliverable/i.test(m))
     return { text: 'The jury could not open that link. Check the URL and try again.', type: 'error' }
+  if (/does not match the submitted commitment/i.test(m))
+    return { text: 'The evidence changed after submission. Nothing was paid or resolved.', type: 'error' }
   if (/sigterm/i.test(m) || /genvm execution error/i.test(m) || m.length > 300)
     return { text: 'The network had a hiccup executing this transaction. It was not caused by your input, try again in a moment.', type: 'error' }
   return { text: m.slice(0, 160) || 'Something went wrong.', type: 'error' }
@@ -207,21 +210,32 @@ export default function App() {
     let agentArg = ''
     try { agentArg = await resolveAgentInput(agent) }
     catch (e) { notify(e.message, 'error'); return }
-    return send('piece handed off', 'subcontract',
+    return send('delegation proposed', 'propose_subcontract',
       [pid, spec, agentArg, genToWeiString(gen), (tags || '').trim()], 0n,
-      async () => { const t = await readTree(); return t && (t[pid]?.children || []).length > (flat?.[pid]?.children || []).length })
+      async () => { const t = await readTree(); return t && (t[pid]?.delegation_proposals || []).length > (flat?.[pid]?.delegation_proposals || []).length })
   }
 
-  const submitWork = (id, urls) =>
-    send('work submitted', 'submit_deliverable', [id, urls.trim()], 0n,
-      async () => { const t = await readTree(); return t && t[id]?.status === 'submitted' })
+  const submitWork = async (id, urls) => {
+    const urlList = urls.split(',').map(u => u.trim()).filter(Boolean)
+    if (!urlList.length) { notify('Add at least one deliverable URL.', 'error'); return }
+    setBusy('hashing evidence')
+    try {
+      const commitment = await createEvidenceCommitment(urlList)
+      return await send('work submitted', 'submit_deliverable', [id, urlList.join(','), commitment], 0n,
+        async () => { const t = await readTree(); return t && t[id]?.status === 'submitted' })
+    } catch (e) {
+      const { text, type } = friendlyError(e)
+      notify(text, type)
+      setBusy('')
+    }
+  }
 
-  const askJury = async (id) => {
+  const settleTask = async (id, method) => {
     if (!account) { notify('Connect a wallet first.', 'error'); return }
     setBusy('jury asked')
     setTx({ phase: 'PENDING' })
     try {
-      await writeContract(account, 'resolve_task', [id], 0n, phase => setTx({ phase }))
+      await writeContract(account, method, [id], 0n, phase => setTx({ phase }))
       await pollForChange(async () => { const t = await readTree(); return t && t[id]?.status === 'resolved' })
       await load(rootId)
       setBoardReload(k => k + 1)
@@ -250,10 +264,17 @@ export default function App() {
       setForm(null)
     } catch (e) {
       const { text, type } = friendlyError(e)
-      setTx({ phase: 'failed', error: text, retry: () => askJury(id) })
+      setTx({ phase: 'failed', error: text, retry: () => settleTask(id, method) })
       notify(text, type)
     } finally { setBusy('') }
   }
+
+  const askJury = (id) => settleTask(id, 'resolve_task')
+  const settleTimeout = (id) => settleTask(id, 'settle_after_timeout')
+
+  const approveDelegation = (id) =>
+    send('delegation approved', 'approve_subcontract', [id], 0n,
+      async () => { const t = await readTree(); return t && t[id]?.status === 'posted' })
 
   const explainAgain = (id) =>
     send('explanation updated', 'explain_task', [id], 0n, null)
@@ -289,6 +310,7 @@ export default function App() {
     const isAgent = account === t.agent
     const isBuyer = account === t.buyer
     const isOpen = t.agent === ''
+    const timeoutEligible = isTimeoutEligible(t)
     const kidsDone = (t.children || []).every(c => ['resolved', 'reclaimed'].includes(flat[c]?.status))
     // reclaim_task requires every child to specifically be 'reclaimed',
     // not 'resolved' too, that's a different, stricter bar than the one
@@ -296,6 +318,7 @@ export default function App() {
     // when the contract would actually still reject it.
     const kidsReclaimed = (t.children || []).every(c => flat[c]?.status === 'reclaimed')
     const A = []
+    if (isBuyer && t.status === 'proposed') A.push(['Approve exact delegation', () => approveDelegation(id), true])
     if (isOpen && t.status === 'posted') A.push(['Claim this job', () => claimTask(id), true])
     if (isAgent && t.status === 'posted') {
       A.push(['Hand off a piece', () => setForm({ kind: 'hand', id }), false])
@@ -303,6 +326,7 @@ export default function App() {
     }
     if (isAgent && t.status === 'submitted') A.push(['Pull submission', () => pull(id), false])
     if (isBuyer && t.status === 'submitted' && kidsDone) A.push(['Ask the jury', () => askJury(id), true])
+    if (t.status === 'submitted' && kidsDone && timeoutEligible) A.push(['Settle after timeout', () => settleTimeout(id), true])
     if (isBuyer && t.status === 'posted' && kidsReclaimed) A.push(['Take it back', () => takeBack(id), false])
     // Fallback for the rare case the automatic explain_task call after
     // resolve_task didn't go through, either side can retry it, it moves
@@ -312,19 +336,21 @@ export default function App() {
     // Resolve is buyer-only now. Without this, an agent who's submitted
     // and is just waiting sees an empty action row with no explanation,
     // which reads as broken rather than "the buyer has to act now."
-    const waiting = isAgent && !isBuyer && t.status === 'submitted' && kidsDone
+    const waiting = isAgent && !isBuyer && t.status === 'submitted' && kidsDone && !timeoutEligible
+    const awaitingApproval = t.status === 'proposed' && !isBuyer
     // Buyer wants to reclaim but a child hasn't been reclaimed yet, tell
     // them why the button isn't there instead of leaving it silent.
     const blockedReclaim = isBuyer && t.status === 'posted' && !kidsReclaimed && (t.children || []).length > 0
 
-    if (!A.length && !waiting && !blockedReclaim) return null
+    if (!A.length && !waiting && !awaitingApproval && !blockedReclaim) return null
     return (
       <>
         {blockedReclaim && <p className="waiting-note">A subcontracted piece must be taken back first before this one can be.</p>}
         {A.map(([label, fn, primary]) => (
           <button key={label} className={'btn-sm' + (primary ? ' primary' : '')} onClick={fn} disabled={!!busy}>{label}</button>
         ))}
-        {waiting && <p className="waiting-note">Submitted. Waiting for the buyer to ask the jury.</p>}
+        {waiting && <p className="waiting-note">Submitted. Waiting for the buyer to ask the jury or for timeout eligibility.</p>}
+        {awaitingApproval && <p className="waiting-note">Delegation proposed. The root buyer must approve these exact terms before it becomes active.</p>}
       </>
     )
   }
@@ -445,12 +471,12 @@ export default function App() {
           <div className="value">
             <div className="value-icon"><IconBranch /></div>
             <h3>Work runs downhill</h3>
-            <p>An agent can hand off part of a job, paid out of their own share. Every level is graded on its own deliverable before its parent can settle.</p>
+            <p>An agent can propose handing off part of a job. The root buyer must approve the exact subcontractor, spec, amount, and tags before any allocation moves.</p>
           </div>
           <div className="value">
             <div className="value-icon"><IconExit /></div>
             <h3>Nothing gets stuck</h3>
-            <p>A jury that doesn't answer costs a retry, not your money. Either side can walk away without the other's consent.</p>
+            <p>Submitted work gets a fixed resolution deadline. After it passes, anyone can invoke the same jury and graduated payout without waiting for the buyer.</p>
           </div>
         </div>
       </section>
@@ -473,8 +499,8 @@ export default function App() {
           <div className="step">
             <div className="step-num">02</div>
             <div className="step-body">
-              <h3><IconBranch style={{ width: 16, height: 16, display: 'inline', verticalAlign: -2, marginRight: 6 }} />Carve out a piece<span className="step-tag">subcontract</span></h3>
-              <p>The agent can hand part of the job to someone else, out of their own allocation. The contract won't let them promise more than they hold, so the tree can't go insolvent.</p>
+              <h3><IconBranch style={{ width: 16, height: 16, display: 'inline', verticalAlign: -2, marginRight: 6 }} />Propose a piece<span className="step-tag">propose / approve</span></h3>
+              <p>The agent proposes exact terms. The root buyer approves before the child activates or the parent's available allocation changes.</p>
             </div>
           </div>
           <div className="step">
@@ -487,8 +513,8 @@ export default function App() {
           <div className="step">
             <div className="step-num">04</div>
             <div className="step-body">
-              <h3><IconExit style={{ width: 16, height: 16, display: 'inline', verticalAlign: -2, marginRight: 6 }} />Always a way out<span className="step-tag">withdraw / reclaim</span></h3>
-              <p>No timeout, because no clock here is worth trusting. The agent can pull their submission any time; the buyer can reclaim only once nothing is submitted.</p>
+              <h3><IconExit style={{ width: 16, height: 16, display: 'inline', verticalAlign: -2, marginRight: 6 }} />Committed evidence<span className="step-tag">SHA-256 / timeout</span></h3>
+              <p>The submitted content is hash-bound. If the buyer does not resolve before the deterministic deadline, anyone can trigger the same jury settlement.</p>
             </div>
           </div>
         </div>
@@ -629,7 +655,7 @@ export default function App() {
             </div>
           </div>
         </div>
-        <div className="foot-fine">{`The jury reads the first 4,000 characters of whatever you link. Focused artifacts grade reliably: a component, a module, a diff. A thousand-line file gets sampled.
+        <div className="foot-fine">{`The jury reads a bounded excerpt of each hash-verified deliverable. Focused artifacts grade reliably: a component, a module, a diff. A thousand-line file gets sampled.
 
 Grading is judgment, not arithmetic. Two juries can land a band apart on the same work. That is why it is a band and not a number.`}</div>
       </footer>
